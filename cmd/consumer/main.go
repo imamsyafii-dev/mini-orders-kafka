@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,9 @@ const (
 )
 
 func main() {
+	name := flag.String("name", "worker-unnamed", "Nama consumer untuk log")
+	flag.Parse()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -35,7 +39,8 @@ func main() {
 	defer client.Close()
 
 	fmt.Printf(
-		"consumer started group=%s topic=%s; press Ctrl+C to stop\n",
+		"consumer=%s started group=%s topic=%s; press Ctrl+C to stop\n",
+		*name,
 		consumerGroup,
 		topic,
 	)
@@ -44,13 +49,13 @@ func main() {
 		fetches := client.PollFetches(ctx)
 
 		if ctx.Err() != nil {
-			fmt.Println("\nconsumer stopped")
+			fmt.Printf("\nconsumer=%s stopped\n", *name)
 			return
 		}
 
 		if errs := fetches.Errors(); len(errs) > 0 {
 			for _, fetchErr := range errs {
-				log.Printf("consume error: %v", fetchErr.Err)
+				log.Printf("consumer=%s consume error: %v", *name, fetchErr.Err)
 			}
 			continue
 		}
@@ -58,15 +63,15 @@ func main() {
 		fetches.EachRecord(func(record *kgo.Record) {
 			var orderCreated event.OrderCreated
 			if err := json.Unmarshal(record.Value, &orderCreated); err != nil {
-				log.Printf("decode event: %v", err)
+				log.Printf("consumer=%s decode event: %v", *name, err)
 				return
 			}
 
 			fmt.Printf(
-				"received event_id=%s order_id=%s amount=%d partition=%d offset=%d\n",
-				orderCreated.EventID,
+				"consumer=%s order_id=%s sequence=%d partition=%d offset=%d\n",
+				*name,
 				orderCreated.Payload.OrderID,
-				orderCreated.Payload.Amount,
+				orderCreated.Payload.Sequence,
 				record.Partition,
 				record.Offset,
 			)

@@ -13,4 +13,5 @@ type OrderCreatedData struct {
 	OrderID    string `json:"order_id"`
 	CustomerID string `json:"customer_id"`
 	Amount     int64  `json:"amount"`
+	Sequence   int    `json:"sequence"`
 }

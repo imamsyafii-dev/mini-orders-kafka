@@ -1,0 +1,84 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/imamsyafii-dev/mini-orders-kafka/internal/event"
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+const (
+	topic         = "orders.v1"
+	consumerGroup = "orders-learning-v1"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers()...),
+		kgo.ConsumerGroup(consumerGroup),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		log.Fatalf("create Kafka client: %v", err)
+	}
+	defer client.Close()
+
+	fmt.Printf(
+		"consumer started group=%s topic=%s; press Ctrl+C to stop\n",
+		consumerGroup,
+		topic,
+	)
+
+	for {
+		fetches := client.PollFetches(ctx)
+
+		if ctx.Err() != nil {
+			fmt.Println("\nconsumer stopped")
+			return
+		}
+
+		if errs := fetches.Errors(); len(errs) > 0 {
+			for _, fetchErr := range errs {
+				log.Printf("consume error: %v", fetchErr.Err)
+			}
+			continue
+		}
+
+		fetches.EachRecord(func(record *kgo.Record) {
+			var orderCreated event.OrderCreated
+			if err := json.Unmarshal(record.Value, &orderCreated); err != nil {
+				log.Printf("decode event: %v", err)
+				return
+			}
+
+			fmt.Printf(
+				"received event_id=%s order_id=%s amount=%d partition=%d offset=%d\n",
+				orderCreated.EventID,
+				orderCreated.Payload.OrderID,
+				orderCreated.Payload.Amount,
+				record.Partition,
+				record.Offset,
+			)
+		})
+	}
+}
+
+func brokers() []string {
+	raw := os.Getenv("KAFKA_BROKERS")
+	if raw == "" {
+		return []string{"localhost:9092"}
+	}
+
+	return strings.Split(raw, ",")
+}

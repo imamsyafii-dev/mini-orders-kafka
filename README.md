@@ -156,3 +156,96 @@ tambahan sampai seluruh partition terlihat.
 
 Tahap ini masih memakai auto-commit. Manual commit, retry, DLQ, dan
 idempotency akan dibahas pada tahap berikutnya.
+
+## Tahap 3: manual commit dan replay
+
+Consumer Tahap 3 menonaktifkan auto-commit. Urutan prosesnya adalah:
+
+```text
+fetch → decode → processed → commit
+```
+
+Jika sebuah record berada di offset `12`, commit sukses berarti Kafka menyimpan
+posisi berikutnya sebagai offset `13`.
+
+### Jalur sukses
+
+Terminal A:
+
+```bash
+go run ./cmd/consumer \
+  --name stage3-worker \
+  --group orders-stage3 \
+  --offset-reset latest
+```
+
+Tunggu sampai consumer aktif, lalu di Terminal B:
+
+```bash
+go run ./cmd/producer \
+  --order-id stage3-order \
+  --customer-id customer-stage3 \
+  --amount 175000
+```
+
+Consumer harus menampilkan urutan:
+
+```text
+received → processed → committed
+```
+
+Periksa committed offset:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group orders-stage3
+```
+
+### Restart tanpa replay
+
+1. Hentikan consumer dengan `Ctrl+C`.
+2. Jalankan consumer lagi dengan group yang sama.
+3. Event yang telah di-commit tidak boleh muncul lagi.
+4. Hentikan consumer tersebut dengan `Ctrl+C` sebelum melanjutkan ke demo crash.
+
+### Crash sebelum commit
+
+Terminal A:
+
+```bash
+go run ./cmd/consumer \
+  --name crash-worker \
+  --group orders-stage3 \
+  --offset-reset latest \
+  --crash-before-commit
+```
+
+Terminal B:
+
+```bash
+go run ./cmd/producer \
+  --order-id stage3-order \
+  --customer-id customer-stage3 \
+  --amount 175000
+```
+
+Consumer harus menampilkan `received`, `processed`, lalu `simulating crash before commit`.
+Tidak boleh ada log `committed`.
+
+Jalankan kembali consumer tanpa flag crash:
+
+```bash
+go run ./cmd/consumer \
+  --name restarted-worker \
+  --group orders-stage3 \
+  --offset-reset latest
+```
+
+Event dengan `event_id`, partition, dan offset yang sama harus muncul lagi, lalu
+berhasil di-commit.
+
+Ini adalah perilaku **at-least-once**: side effect dapat terjadi dua kali jika
+proses crash setelah processing tetapi sebelum offset di-commit. Idempotency,
+retry, dan DLQ akan dibahas pada tahap berikutnya.

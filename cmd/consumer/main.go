@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/imamsyafii-dev/mini-orders-kafka/internal/event"
+	"github.com/imamsyafii-dev/mini-orders-kafka/internal/store"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -22,10 +23,11 @@ func main() {
 	name := flag.String("name", "worker-unnamed", "Nama consumer untuk log")
 	group := flag.String("group", "orders-learning-v1", "Kafka consumer group")
 	offsetReset := flag.String("offset-reset", "earliest", "Offset awal untuk group baru: earliest atau latest")
+	dbPath := flag.String("db-path", "./data/orders.db", "Path SQLite database")
 	crashBeforeCommit := flag.Bool(
 		"crash-before-commit",
 		false,
-		"Simulasikan crash setelah processing dan sebelum commit",
+		"Simulasikan crash setelah transaksi database dan sebelum commit Kafka",
 	)
 	flag.Parse()
 
@@ -33,6 +35,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	orderStore, err := store.OpenSQLite(*dbPath)
+	if err != nil {
+		log.Fatalf("open idempotency store: %v", err)
+	}
+	defer orderStore.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -50,10 +58,11 @@ func main() {
 	defer client.Close()
 
 	fmt.Printf(
-		"consumer=%s started group=%s topic=%s auto_commit=false; press Ctrl+C to stop\n",
+		"consumer=%s started group=%s topic=%s auto_commit=false db=%s; press Ctrl+C to stop\n",
 		*name,
 		*group,
 		topic,
+		*dbPath,
 	)
 
 	for {
@@ -81,6 +90,7 @@ func main() {
 			processingErr = processRecord(
 				ctx,
 				client,
+				orderStore,
 				record,
 				*name,
 				*crashBeforeCommit,
@@ -96,13 +106,15 @@ func main() {
 func processRecord(
 	ctx context.Context,
 	client *kgo.Client,
+	orderStore *store.SQLiteStore,
 	record *kgo.Record,
 	name string,
 	crashBeforeCommit bool,
 ) error {
 	var orderCreated event.OrderCreated
 	if err := json.Unmarshal(record.Value, &orderCreated); err != nil {
-		return fmt.Errorf("decode event at partition=%d offset=%d: %w",
+		return fmt.Errorf(
+			"decode event at partition=%d offset=%d: %w",
 			record.Partition,
 			record.Offset,
 			err,
@@ -119,18 +131,35 @@ func processRecord(
 		record.Offset,
 	)
 
-	fmt.Printf(
-		"consumer=%s processed event_id=%s partition=%d offset=%d\n",
-		name,
-		orderCreated.EventID,
-		record.Partition,
-		record.Offset,
-	)
+	applied, err := orderStore.ApplyOrderCreated(ctx, orderCreated)
+	if err != nil {
+		return fmt.Errorf(
+			"apply event_id=%s partition=%d offset=%d: %w",
+			orderCreated.EventID,
+			record.Partition,
+			record.Offset,
+			err,
+		)
+	}
+
+	if applied {
+		fmt.Printf(
+			"consumer=%s business_effect_applied event_id=%s\n",
+			name,
+			orderCreated.EventID,
+		)
+	} else {
+		fmt.Printf(
+			"consumer=%s duplicate_skipped event_id=%s\n",
+			name,
+			orderCreated.EventID,
+		)
+	}
 
 	if crashBeforeCommit {
 		fmt.Fprintf(
 			os.Stderr,
-			"consumer=%s simulating crash before commit event_id=%s\n",
+			"consumer=%s simulating crash before Kafka commit event_id=%s\n",
 			name,
 			orderCreated.EventID,
 		)
@@ -148,7 +177,7 @@ func processRecord(
 	}
 
 	fmt.Printf(
-		"consumer=%s committed event_id=%s next_offset=%d\n",
+		"consumer=%s offset_committed event_id=%s next_offset=%d\n",
 		name,
 		orderCreated.EventID,
 		record.Offset+1,

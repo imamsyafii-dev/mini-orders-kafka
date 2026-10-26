@@ -249,3 +249,108 @@ berhasil di-commit.
 Ini adalah perilaku **at-least-once**: side effect dapat terjadi dua kali jika
 proses crash setelah processing tetapi sebelum offset di-commit. Idempotency,
 retry, dan DLQ akan dibahas pada tahap berikutnya.
+
+## Tahap 4: idempotency dengan SQLite
+
+Tahap ini memakai SQLite sebagai inbox/idempotency store.
+
+Dalam satu transaksi database, consumer:
+
+1. Menyimpan `event_id` ke `processed_events`.
+2. Menulis simulated business side effect ke `business_effects`.
+3. Baru setelah transaksi database sukses, commit offset Kafka.
+
+Jika consumer crash setelah transaksi SQLite sukses tetapi sebelum commit Kafka,
+Kafka me-replay event yang sama. SQLite sudah mengenali `event_id`, sehingga
+business effect tidak dibuat dua kali.
+
+### Menjalankan demo
+
+Gunakan database dan consumer group baru:
+
+Terminal A:
+
+```bash
+go run ./cmd/consumer \
+  --name stage4-worker \
+  --group orders-stage4 \
+  --offset-reset latest \
+  --db-path ./data/orders-stage4.db
+```
+
+Terminal B:
+
+```bash
+go run ./cmd/producer \
+  --order-id stage4-order \
+  --customer-id customer-stage4 \
+  --amount 200000
+```
+
+Consumer harus menampilkan:
+
+```text
+received → business_effect_applied → offset_committed
+```
+
+Jika `sqlite3` tersedia, periksa jumlah side effect:
+
+```bash
+sqlite3 ./data/orders-stage4.db \
+  'SELECT COUNT(*) FROM business_effects;'
+```
+
+Hasilnya `1`.
+
+### Crash setelah database commit
+
+1. Hentikan consumer normal.
+2. Jalankan consumer dengan database dan group sama:
+
+```bash
+go run ./cmd/consumer \
+  --name crash-worker \
+  --group orders-stage4 \
+  --offset-reset latest \
+  --db-path ./data/orders-stage4.db \
+  --crash-before-commit
+```
+
+3. Kirim satu event baru dengan key yang sama:
+
+```bash
+go run ./cmd/producer \
+  --order-id stage4-order \
+  --customer-id customer-stage4 \
+  --amount 210000
+```
+
+Consumer harus menampilkan `business_effect_applied`, lalu crash tanpa
+`offset_committed`. Jumlah `business_effects` menjadi `2`.
+
+4. Jalankan kembali consumer tanpa flag crash:
+
+```bash
+go run ./cmd/consumer \
+  --name replay-worker \
+  --group orders-stage4 \
+  --offset-reset latest \
+  --db-path ./data/orders-stage4.db
+```
+
+Event yang sama akan direplay, tetapi consumer menampilkan:
+
+```text
+duplicate_skipped → offset_committed
+```
+
+Jumlah `business_effects` harus tetap `2`, bukan `3`.
+
+### Batasan
+
+- Ini bukan exactly-once global.
+- Email, HTTP request, atau database lain tidak otomatis menjadi idempotent.
+- `event_id` harus stabil saat Kafka me-replay record.
+- SQLite file lokal cocok untuk lab atau single instance; production multi-instance
+  membutuhkan database bersama dengan unique constraint yang setara.
+- Retention/cleanup `processed_events` belum dibahas.
